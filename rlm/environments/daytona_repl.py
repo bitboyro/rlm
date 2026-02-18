@@ -1,31 +1,72 @@
+"""
+Daytona REPL environment that runs Python code in Daytona sandboxes.
+
+Uses the Daytona API (https://daytona.io/docs) for sandbox management.
+"""
+
 import base64
 import json
+import os
 import textwrap
 import threading
 import time
+from typing import Any
 
-import modal
 import requests
+from daytona import (
+    CreateSandboxFromImageParams,
+    Daytona,
+    DaytonaConfig,
+    Image,
+    Resources,
+    SessionExecuteRequest,
+)
 
 from rlm.core.comms_utils import LMRequest, send_lm_request, send_lm_request_batched
 from rlm.core.types import REPLResult, RLMChatCompletion
-from rlm.environments.base_env import IsolatedEnv
-from rlm.environments.constants import APT_PACKAGES, PIP_PACKAGES
+from rlm.environments.base_env import IsolatedEnv, extract_tool_value, validate_custom_tools
 
 # =============================================================================
-# Default Modal Image
+# Default Daytona Image
 # =============================================================================
 
 
-def get_default_image() -> modal.Image:
+def get_default_image() -> Image:
     """
-    Build a default Modal image with common libraries for data science,
+    Build a default Daytona image with common libraries for data science,
     math, and general Python work.
     """
     return (
-        modal.Image.debian_slim(python_version="3.11")
-        .apt_install(*APT_PACKAGES)
-        .pip_install(*PIP_PACKAGES)
+        Image.debian_slim("3.11")
+        .run_commands(
+            "apt-get update && apt-get install -y build-essential \
+                 git \
+                 curl \
+                 wget \
+                 libopenblas-dev \
+                 liblapack-dev",
+        )
+        .pip_install(
+            # Data science essentials
+            "numpy>=1.26.0",
+            "pandas>=2.1.0",
+            "scipy>=1.11.0",
+            # Math & symbolic computation
+            "sympy>=1.12",
+            # HTTP & APIs
+            "requests>=2.31.0",
+            "httpx>=0.25.0",
+            "flask>=3.0.0",
+            # Data formats
+            "pyyaml>=6.0",
+            "toml>=0.10.2",
+            # Utilities
+            "tqdm>=4.66.0",
+            "python-dateutil>=2.8.2",
+            "regex>=2023.0.0",
+            # For state serialization
+            "dill>=0.3.7",
+        )
     )
 
 
@@ -77,7 +118,7 @@ def enqueue():
 
 @app.route("/pending")
 def get_pending():
-    """Called by ModalREPL to get pending requests."""
+    """Called by DaytonaREPL to get pending requests."""
     with lock:
         pending = [
             {"id": rid, "request": entry["request"]}
@@ -88,7 +129,7 @@ def get_pending():
 
 @app.route("/respond", methods=["POST"])
 def respond():
-    """Called by ModalREPL to submit a response."""
+    """Called by DaytonaREPL to submit a response."""
     data = request.json
     request_id = data.get("id")
     response = data.get("response")
@@ -112,12 +153,54 @@ if __name__ == "__main__":
 # =============================================================================
 
 
-def _build_exec_script(code: str, broker_port: int = 8080, depth: int = 1) -> str:
+def _build_exec_script(
+    code: str,
+    broker_port: int = 8080,
+    depth: int = 1,
+    custom_tools: dict[str, Any] | None = None,
+) -> str:
     """
     Build a script that executes code with state persistence.
     LLM queries go through the local broker server.
+
+    Args:
+        code: The Python code to execute.
+        broker_port: Port for the broker server.
+        depth: Depth level for LLM requests.
+        custom_tools: Dict of custom tools. Values can be:
+            - Strings: Interpreted as Python code defining the tool (executed directly)
+            - Other values: JSON-serialized and loaded as data
     """
     code_b64 = base64.b64encode(code.encode()).decode()
+
+    # Build custom tools injection code
+    custom_tools_code = ""
+    if custom_tools:
+        tool_lines = []
+        for name, entry in custom_tools.items():
+            # Extract value from (value, description) tuple if needed
+            value = extract_tool_value(entry)
+
+            if isinstance(value, str) and (
+                value.strip().startswith("def ")
+                or value.strip().startswith("class ")
+                or value.strip().startswith("lambda")
+                or "\n" in value
+            ):
+                # String looks like code - execute it directly
+                tool_lines.append(f"# Custom tool: {name}")
+                tool_lines.append(value)
+                tool_lines.append(f"_globals['{name}'] = {name}")
+            else:
+                # Serialize as JSON data
+                try:
+                    json_value = json.dumps(value)
+                    tool_lines.append(f"_locals['{name}'] = json.loads('''{json_value}''')")
+                except (TypeError, ValueError):
+                    # Can't serialize - skip with warning
+                    tool_lines.append(f"# Warning: Could not serialize tool '{name}'")
+
+        custom_tools_code = "\n".join(tool_lines)
 
     return textwrap.dedent(
         f'''
@@ -241,6 +324,11 @@ _globals = {{
     "SHOW_VARS": SHOW_VARS,
 }}
 
+# =============================================================================
+# Custom Tools Injection
+# =============================================================================
+{custom_tools_code}
+
 code = base64.b64decode("{code_b64}").decode()
 
 stdout_buf = io.StringIO()
@@ -279,45 +367,91 @@ print(json.dumps(result))
     )
 
 
-class ModalREPL(IsolatedEnv):
+class DaytonaREPL(IsolatedEnv):
     """
-    Modal REPL environment that runs Python code in a Modal Sandbox.
+    Daytona REPL environment that runs Python code in a Daytona Sandbox.
 
-    Uses Modal tunnels for LLM communication:
-    - Sandbox runs a broker server exposed via encrypted_ports
-    - ModalREPL polls the broker for pending LLM requests
-    - ModalREPL forwards requests to the LM handler and posts responses back
+    Uses Daytona preview URLs for LLM communication:
+    - Sandbox runs a broker server exposed via preview URL (port 8080)
+    - DaytonaREPL polls the broker for pending LLM requests
+    - DaytonaREPL forwards requests to the LM handler and posts responses back
     """
 
     BROKER_PORT = 8080
 
     def __init__(
         self,
-        app_name: str = "rlm-sandbox",
-        image: modal.Image | None = None,
+        api_key: str | None = None,
+        target: str = "us",
+        name: str = "rlm-sandbox",
         timeout: int = 600,
+        cpu: int = 1,
+        memory: int = 2,
+        disk: int = 5,
+        auto_stop_interval: int = 0,
+        image: Image | None = None,
         lm_handler_address: tuple[str, int] | None = None,
         context_payload: dict | list | str | None = None,
         setup_code: str | None = None,
         persistent: bool = False,
         depth: int = 1,
+        custom_tools: dict[str, Any] | None = None,
+        custom_sub_tools: dict[str, Any] | None = None,
         **kwargs,
     ):
+        """
+        Initialize a Daytona REPL environment.
+
+        Args:
+            api_key: Daytona API key. If None, uses DAYTONA_API_KEY env var.
+            target: Daytona target region (e.g., "us", "eu").
+            name: Unique identifier for the sandbox.
+            timeout: Sandbox timeout in seconds.
+            cpu: Number of CPU cores for the sandbox.
+            memory: Memory in GB for the sandbox.
+            disk: Disk space in GB for the sandbox.
+            auto_stop_interval: Minutes of inactivity before auto-stop. 0 = run indefinitely.
+            image: Daytona Image object for declarative building. If None, uses default image.
+            lm_handler_address: (host, port) tuple for LM Handler server.
+            context_payload: Initial context to load into the environment.
+            setup_code: Optional code to run during setup.
+            persistent: Whether to persist state across calls (not yet supported).
+            depth: Depth level for LLM request routing (used by LMHandler).
+            custom_tools: Dict of custom tools available in the REPL. For isolated environments,
+                values should be strings containing Python code that defines the function,
+                or simple serializable values (str, int, dict, list).
+            custom_sub_tools: Dict of tools for sub-agents. If None, inherits from custom_tools.
+            **kwargs: Additional arguments passed to base class.
+        """
         if persistent:
             raise NotImplementedError(
-                "Persistent REPLs are currently not supported for environment: ModalREPL"
+                "Persistent REPLs are currently not supported for environment: DaytonaREPL"
             )
         super().__init__(persistent=persistent, depth=depth, **kwargs)
 
-        self.app_name = app_name
+        self.api_key = api_key or os.getenv("DAYTONA_API_KEY")
+        self.target = target
+        self.name = name
         self.timeout = timeout
+        self.cpu = cpu
+        self.memory = memory
+        self.disk = disk
+        self.auto_stop_interval = auto_stop_interval
+        self.image = image or get_default_image()
         self.lm_handler_address = lm_handler_address
 
-        self.image = image or get_default_image()
+        # Custom tools for the REPL environment
+        self.custom_tools = custom_tools or {}
+        self.custom_sub_tools = (
+            custom_sub_tools if custom_sub_tools is not None else self.custom_tools
+        )
 
-        self.app = None
+        # Validate custom tools don't override reserved names
+        validate_custom_tools(self.custom_tools)
+
+        self.daytona = None
         self.sandbox = None
-        self.broker_process = None
+        self.broker_session_id: str = "rlm-broker-session"
         self.broker_url: str | None = None
         self.poller_thread: threading.Thread | None = None
         self.poller_stop = threading.Event()
@@ -333,37 +467,73 @@ class ModalREPL(IsolatedEnv):
             self.execute_code(setup_code)
 
     def setup(self):
-        """Create the Modal app, sandbox, broker, and start polling."""
-        self.app = modal.App.lookup(self.app_name, create_if_missing=True)
+        """Create the Daytona sandbox, broker, and start polling."""
+        # Initialize Daytona client
+        config_kwargs = {"target": self.target}
+        if self.api_key:
+            config_kwargs["api_key"] = self.api_key
 
-        # Create sandbox with encrypted port for broker
-        self.sandbox = modal.Sandbox.create(
-            app=self.app,
-            image=self.image,
-            timeout=self.timeout,
-            encrypted_ports=[self.BROKER_PORT],
+        config = DaytonaConfig(**config_kwargs)
+        self.daytona = Daytona(config)
+
+        # Create sandbox with specified resources
+        resources = Resources(
+            cpu=self.cpu,
+            memory=self.memory,
+            disk=self.disk,
         )
 
-        # Start the broker server in the sandbox
-        self.broker_process = self.sandbox.exec(
-            "python",
-            "-c",
-            _BROKER_SCRIPT,
+        params = CreateSandboxFromImageParams(
+            name=self.name,
+            image=self.image,
+            resources=resources,
+            auto_stop_interval=self.auto_stop_interval,
+        )
+
+        self.sandbox = self.daytona.create(params)
+
+        # Upload the broker script
+        self.sandbox.fs.upload_file(
+            _BROKER_SCRIPT.encode("utf-8"),
+            "broker_server.py",
+        )
+
+        # Create a session for the broker server
+        self.sandbox.process.create_session(self.broker_session_id)
+
+        # Start the broker server in the session (async execution)
+        self.sandbox.process.execute_session_command(
+            self.broker_session_id,
+            SessionExecuteRequest(
+                command="python broker_server.py",
+                var_async=True,
+            ),
         )
 
         # Wait for broker to be ready
-        time.sleep(2)
+        time.sleep(3)
 
-        # Get the tunnel URL
-        tunnels = self.sandbox.tunnels()
-        if self.BROKER_PORT in tunnels:
-            self.broker_url = tunnels[self.BROKER_PORT].url
+        # Get the preview URL for the broker port
+        try:
+            preview_info = self.sandbox.get_preview_link(self.BROKER_PORT)
+            self.broker_url = preview_info.url
+            self._preview_token = preview_info.token
+        except Exception:
+            self.broker_url = None
+            self._preview_token = None
 
         # Start polling thread if we have an LM handler
         if self.lm_handler_address and self.broker_url:
             self.poller_stop.clear()
             self.poller_thread = threading.Thread(target=self._poll_broker, daemon=True)
             self.poller_thread.start()
+
+    def _get_headers(self) -> dict:
+        """Get headers for broker requests including auth token."""
+        headers = {"Content-Type": "application/json"}
+        if hasattr(self, "_preview_token") and self._preview_token:
+            headers["x-daytona-preview-token"] = self._preview_token
+        return headers
 
     def _poll_broker(self):
         """Poll the broker for pending LLM requests and handle them."""
@@ -372,6 +542,7 @@ class ModalREPL(IsolatedEnv):
                 # Get pending requests
                 resp = requests.get(
                     f"{self.broker_url}/pending",
+                    headers=self._get_headers(),
                     timeout=5,
                 )
                 pending = resp.json().get("pending", [])
@@ -386,6 +557,7 @@ class ModalREPL(IsolatedEnv):
                     # Send response back
                     requests.post(
                         f"{self.broker_url}/respond",
+                        headers=self._get_headers(),
                         json={"id": request_id, "response": response},
                         timeout=10,
                     )
@@ -448,7 +620,7 @@ class ModalREPL(IsolatedEnv):
         self.execute_code(context_code)
 
     def execute_code(self, code: str) -> REPLResult:
-        """Execute code in the Modal sandbox and return result."""
+        """Execute code in the Daytona sandbox and return result."""
         start_time = time.perf_counter()
 
         # Clear pending LLM calls
@@ -456,12 +628,23 @@ class ModalREPL(IsolatedEnv):
             self.pending_llm_calls.clear()
 
         # Build and execute the script
-        script = _build_exec_script(code, self.BROKER_PORT, self.depth)
-        process = self.sandbox.exec("python", "-c", script)
+        script = _build_exec_script(
+            code, self.BROKER_PORT, self.depth, custom_tools=self.custom_tools
+        )
+
+        # Upload the script as a temporary file
+        script_path = "/tmp/rlm_exec_script.py"
+        self.sandbox.fs.upload_file(
+            script.encode("utf-8"),
+            script_path,
+        )
+
+        # Execute the script
+        response = self.sandbox.process.exec(f"python {script_path}", timeout=self.timeout)
 
         # Read output
-        stdout = process.stdout.read()
-        stderr = process.stderr.read()
+        stdout = response.result if response.exit_code == 0 else ""
+        stderr = response.result if response.exit_code != 0 else ""
 
         # Collect LLM calls made during this execution
         with self._calls_lock:
@@ -500,9 +683,16 @@ class ModalREPL(IsolatedEnv):
             self.poller_thread.join(timeout=2)
             self.poller_thread = None
 
+        # Delete the broker session
         if self.sandbox is not None:
             try:
-                self.sandbox.terminate()
+                self.sandbox.process.delete_session(self.broker_session_id)
+            except Exception:
+                pass
+
+            # Delete the sandbox
+            try:
+                self.sandbox.delete()
             except Exception:
                 pass
             self.sandbox = None

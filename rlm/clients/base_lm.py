@@ -1,7 +1,10 @@
 from abc import ABC, abstractmethod
 from typing import Any
 
-from rlm.core.types import UsageSummary
+from rlm.core.types import ModelUsageSummary, UsageSummary
+
+# Default timeout for LM API calls (in seconds)
+DEFAULT_TIMEOUT: float = 300.0
 
 
 class BaseLM(ABC):
@@ -10,8 +13,9 @@ class BaseLM(ABC):
     does so in a model-agnostic way, so this class provides a base interface for all language models.
     """
 
-    def __init__(self, model_name: str, **kwargs):
+    def __init__(self, model_name: str, timeout: float = DEFAULT_TIMEOUT, **kwargs):
         self.model_name = model_name
+        self.timeout = timeout
         self.kwargs = kwargs
 
     @abstractmethod
@@ -28,6 +32,6 @@ class BaseLM(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def get_last_usage(self) -> UsageSummary:
+    def get_last_usage(self) -> ModelUsageSummary:
         """Get the last cost summary of the model."""
         raise NotImplementedError

@@ -128,6 +128,33 @@ multiline answer)"""
         result = find_final_answer(text)
         assert result == "answer with spaces"
 
+    def test_final_with_nested_parentheses_greedy_matching(self):
+        """Test that greedy matching captures content with nested parentheses correctly.
+        Greedy matching (.*) matches to the last closing parenthesis, correctly handling
+        nested parentheses in FINAL() content. Non-greedy (.*?) would incorrectly stop
+        at the first closing parenthesis, breaking functions, tuples, and nested structures.
+        """
+        # Function call with nested parentheses
+        text = "FINAL(func(arg1, arg2))"
+        result = find_final_answer(text)
+        assert result == "func(arg1, arg2)"
+
+        # List and tuple with multiple closing parentheses
+        text = "FINAL([1, 2, 3], (4, 5))"
+        result = find_final_answer(text)
+        assert result == "[1, 2, 3], (4, 5)"
+
+        # Complex nested dictionary
+        text = "FINAL({'key': 'value', 'nested': {'a': 1, 'b': 2}})"
+        result = find_final_answer(text)
+        assert "'key': 'value'" in result
+        assert "'nested':" in result
+
+        # Multiple function calls with nested parentheses
+        text = "FINAL(calculate(10, 20) + process(data))"
+        result = find_final_answer(text)
+        assert result == "calculate(10, 20) + process(data)"
+
     def test_final_and_final_var_parsing(self):
         """Test that both FINAL and FINAL_VAR patterns are parsed correctly."""
         # Test FINAL with various content types
@@ -232,12 +259,24 @@ multiline answer)"""
             result = find_final_answer(text, environment=env)
             assert result == "100", f"Expected '100', got '{result}'"
 
-            # Test that non-existent variable returns error message
+            # Non-existent variable: find_final_answer must return None (not the error string)
+            # so the RLM loop continues and the model can fix it
             text = "FINAL_VAR(nonexistent)"
             result = find_final_answer(text, environment=env)
-            assert "Error" in result or "not found" in result.lower()
+            assert result is None, "must return None for variable-not-found, not the error message"
         finally:
             env.cleanup()
+
+    def test_final_var_variable_not_found_returns_none(self):
+        """When env returns FINAL_VAR 'variable not found' error, find_final_answer must return None."""
+        mock_env = Mock()
+        mock_env.execute_code.return_value = REPLResult(
+            stdout="Error: Variable 'missing' not found. Available variables: []. You must create and assign a variable BEFORE calling FINAL_VAR on it.",
+            stderr="",
+            locals={},
+        )
+        result = find_final_answer("FINAL_VAR(missing)", environment=mock_env)
+        assert result is None
 
 
 class TestFormatExecutionResult:

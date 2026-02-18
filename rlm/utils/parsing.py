@@ -49,12 +49,20 @@ def find_final_answer(text: str, environment: "BaseEnv | None" = None) -> str | 
             result = environment.execute_code(f"print(FINAL_VAR({variable_name!r}))")
             final_answer = result.stdout.strip()
             if final_answer == "":
-                final_answer = result.stderr.strip() or ""
+                return None
+            # Don't treat FINAL_VAR "variable not found" as final answer (so RLM continues)
+            if (
+                "Variable '" in final_answer
+                and "' not found" in final_answer
+                and "FINAL_VAR" in final_answer
+            ):
+                return None
             return final_answer
         return None
 
     # Check for FINAL pattern - must be at start of line
-    final_pattern = r"^\s*FINAL\((.*?)\)"
+    # Use greedy matching to capture content with nested parentheses
+    final_pattern = r"^\s*FINAL\((.*)\)\s*$"
     match = re.search(final_pattern, text, re.MULTILINE | re.DOTALL)
     if match:
         return match.group(1).strip()
